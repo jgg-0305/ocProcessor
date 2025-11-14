@@ -1,12 +1,15 @@
-# pdf_hybrid_converter_v12_kor.py
-# 하이브리드 PDF->DOCX v12.1 (이미지 + 데이터 표 + *모든* 벡터 박스)
+# pdf_hybrid_converter_v14_kor.py
+# 하이브리드 PDF->DOCX v14 (이미지 + 하이브리드 표 + 벡터 박스)
 #
-# 전략: 3가지 엔진을 모두 사용
-#  - 1. find_image_elements: 비트맵 이미지(플로우차트 등) -> '이미지'로 삽입
-#  - 2. find_table_bboxes: 데이터 표('패스1/패스2' 등) -> '1x1 편집 가능 표'로 삽입
-#  - 3. find_drawing_bboxes: [v12.1] *모든* 벡터 박스('세그먼트' 등) -> '1x1 편집 가능 표'로 삽입
+# 전략: 3가지 엔진 결합 + 중복 제거
+#  - 1. find_image_elements: 비트맵 이미지 -> '이미지'로 삽입
+#  - 2. find_tables_hybrid:
+#     - (A) 데이터 표 -> '다중 셀 표'로 삽입
+#     - (B) 1줄 박스 -> '1x1 표'로 삽입
+#  - 3. find_drawing_bboxes: 기타 벡터 박스 -> '1x1 표'로 삽입
+#  - 4. (2)와 (3)의 결과를 중복 제거하여 통합
 #
-# 사용법: python pdf_hybrid_converter_v12_kor.py input.pdf output.docx
+# 사용법: python pdf_hybrid_converter_v14_kor.py input.pdf output.docx
 #
 import sys, os, io, math, traceback
 import fitz  # pymupdf
@@ -61,11 +64,12 @@ def find_image_elements(page, doc):
             print(f"  [!] 임베디드 이미지 추출 오류 (xref={xref}): {e}")
     return final_elements
 
-# --- [엔진 2: v10.4] 데이터 '표' 좌표 감지 함수 ---
-def find_table_bboxes(page):
-    """ (v10.4) page.find_tables()를 사용해 '데이터 표' 영역의 '좌표(bbox)'만 가져옵니다. """
+# --- [엔진 2: v13] '하이브리드 표' 감지 함수 ---
+def find_tables_hybrid(page):
+    """ (v13) '데이터 표'와 '장식용 박스'를 구분하여 감지 """
     tables = page.find_tables()
-    final_bboxes = []
+    final_elements = []
+    
     for tab in tables:
         try:
             bbox_data = tab.bbox 
@@ -80,15 +84,49 @@ def find_table_bboxes(page):
 
             if bbox_rect.is_empty or not bbox_rect.is_valid:
                 continue
+            
+            # --- [v13] 하이브리드 로직 분기 ---
+            if tab.row_count > 1:
+                # A. '데이터 표' (예: '패스1/패스2') -> 원본 구조 복원 시도
+                cells_data = []
+                extracted_rows = tab.extract()
+                if not extracted_rows: continue
                 
-            final_bboxes.append({
-                "type": "table_bbox", # -> 1x1 표로 처리
-                "bbox": bbox_rect.irect,
-                "source": "table_bbox"
-            })
+                clean_rows = []
+                max_cols = 0
+                for r_idx, row in enumerate(extracted_rows):
+                    if row:
+                        clean_row = [str(cell).strip() if cell else "" for cell in row]
+                        max_cols = max(max_cols, len(clean_row))
+                        clean_rows.append(clean_row)
+                
+                if not clean_rows or max_cols == 0: continue
+                
+                final_cells_data = []
+                for r_idx, row in enumerate(clean_rows):
+                    row_data = row + [""] * (max_cols - len(row)) # 빈 셀 채우기
+                    for c_idx, text in enumerate(row_data):
+                        final_cells_data.append( (r_idx, c_idx, text) )
+
+                final_elements.append({
+                    "type": "data_table", # -> '다중 셀 표'로 처리
+                    "bbox": bbox_rect.irect,
+                    "data": (len(clean_rows), max_cols, final_cells_data),
+                    "source": "table_data"
+                })
+            
+            elif tab.row_count == 1:
+                # B. '장식용 박스' (예: '세그먼트 기법') -> 1x1 표로 처리
+                final_elements.append({
+                    "type": "box_table", # -> '1x1 표'로 처리
+                    "bbox": bbox_rect.irect,
+                    "source": "table_box"
+                })
+            
         except Exception as e:
-            print(f"  [!] 표 bbox 처리 오류: {e}")
-    return final_bboxes
+            print(f"  [!] 표 감지 처리 오류: {e}")
+            
+    return final_elements
 
 # --- [엔진 3: v12.1] *모든* 벡터 '박스' 좌표 감지 함수 ---
 def find_drawing_bboxes(page, min_area_pt=50, merge_margin=10):
@@ -96,11 +134,9 @@ def find_drawing_bboxes(page, min_area_pt=50, merge_margin=10):
     drawings = page.get_drawings()
     if not drawings: return []
     
-    # --- v12.1 수정: 'l', 're' 필터 제거. 모든 드로잉 타입을 감지 ---
     paths = [d["rect"] for d in drawings if d["rect"].get_area() > 0]
     if not paths: return []
 
-    # v8 로직: 가까운 드로잉을 클러스터링
     rects = list(paths)
     merged = True
     while merged:
@@ -120,21 +156,20 @@ def find_drawing_bboxes(page, min_area_pt=50, merge_margin=10):
     
     final_bboxes = []
     for rect in rects:
-        # 너무 작은 클러스터는 무시
         if rect.get_area() < min_area_pt: 
             continue
         
-        # v12: 렌더링(이미지 캡처) 대신, bbox만 반환
         final_bboxes.append({
-            "type": "table_bbox", # -> 1x1 표로 처리
+            "type": "box_table", # -> '1x1 표'로 처리
             "bbox": rect.irect, 
-            "source": "drawing_bbox"
+            "source": "drawing_box"
         })
     return final_bboxes
 
-# --- [v12.1] 메인 변환 함수 ---
-def convert_pdf_to_word_v12_1(pdf_path, word_path, dpi=200, max_width_in=6.5, debug_dir="./debug_v12"):
-    print(f"--- PDF->Word v12.1 (3중 감지) 시작 ---")
+
+# --- [v14] 메인 변환 함수 ---
+def convert_pdf_to_word_v14(pdf_path, word_path, dpi=200, max_width_in=6.5, debug_dir="./debug_v14"):
+    print(f"--- PDF->Word v14 (최종 전략) 시작 ---")
     print(f"입력: {pdf_path}")
     pdf = fitz.open(pdf_path)
     doc = docx.Document()
@@ -151,11 +186,11 @@ def convert_pdf_to_word_v12_1(pdf_path, word_path, dpi=200, max_width_in=6.5, de
         image_elements = find_image_elements(page, pdf)
         print(f"  임베디드(비트맵) 이미지 감지: {len(image_elements)}")
         
-        # 엔진 2: 데이터 표 (-> 1x1 표)
-        table_elements = find_table_bboxes(page)
+        # 엔진 2: 데이터 표 + 장식용 박스 (-> 표)
+        table_elements = find_tables_hybrid(page)
         print(f"  표/박스(Table) 영역 감지: {len(table_elements)}")
 
-        # 엔진 3: 벡터 박스 (-> 1x1 표)
+        # 엔진 3: 기타 벡터 박스 (-> 1x1 표)
         drawing_elements = find_drawing_bboxes(page, min_area_pt=50)
         print(f"  드로잉(벡터 박스) 영역 감지: {len(drawing_elements)}")
 
@@ -168,11 +203,10 @@ def convert_pdf_to_word_v12_1(pdf_path, word_path, dpi=200, max_width_in=6.5, de
             all_elements.append(el)
             all_filter_rects.append(el["bbox"])
 
-        # 편집 가능한 표/박스 요소를 추가
+        # 편집 가능한 표/박스 요소를 추가 (엔진 2 + 엔진 3)
         editable_boxes = table_elements + drawing_elements
         
-        # v12.1: 표/박스 간의 중복(포함 관계) 제거
-        # (예: '패스1/패스2'는 '표'이면서 '드로잉'일 수 있음. 더 큰 영역만 남김)
+        # [v14] 중복 제거 로직
         final_editable_boxes = []
         if editable_boxes:
             # bbox 기준으로 정렬 (더 큰 박스가 먼저 오도록)
@@ -203,7 +237,6 @@ def convert_pdf_to_word_v12_1(pdf_path, word_path, dpi=200, max_width_in=6.5, de
             block_rect = fitz.Rect(x0, y0, x1, y1)
             is_inside_other_element = False
             
-            # (v12) 모든 필터 영역(이미지+표+박스) 내부 텍스트는 무시
             for filter_rect in all_filter_rects:
                 if (filter_rect + (-2,-2,2,2)).contains(block_rect):
                     is_inside_other_element = True
@@ -250,31 +283,49 @@ def convert_pdf_to_word_v12_1(pdf_path, word_path, dpi=200, max_width_in=6.5, de
                 except Exception as e:
                     print(f"  [!] 이미지 삽입 실패: {e}")
 
-            # [v12] '데이터 표'와 '벡터 박스' 모두 1x1 표로 삽입
-            elif el["type"] == "table_bbox":
+            # [v13] A. '데이터 표' (다중 셀) 삽입
+            elif el["type"] == "data_table":
+                try:
+                    (rows, cols, cells_data) = el["data"]
+                    if rows == 0 or cols == 0: continue
+                        
+                    table = doc.add_table(rows=rows, cols=cols)
+                    table.style = 'Table Grid'
+                    
+                    for (r, c, text) in cells_data:
+                        if r < rows and c < cols:
+                            table.cell(r, c).text = text
+                            
+                    doc.add_paragraph()
+                    
+                except Exception as e:
+                    print(f"  [!] '데이터 표' 삽입 실패: {e}")
+
+            # [v13/v14] B. '장식용 박스' (1x1 셀) 삽입
+            elif el["type"] == "box_table":
                 try:
                     table_bbox_float = fitz.Rect(el["bbox"])
                     
-                    # 해당 박스(bbox) 영역의 텍스트만 다시 추출
                     box_text = page.get_text(clip=table_bbox_float, sort=True, flags=0).strip()
 
-                    if not box_text: # 텍스트가 없는 빈 박스면(예: 하이라이트) 무시
+                    if not box_text:
+                        # [v14] 텍스트가 없는 순수 드로잉 박스(예: 하이라이트)는 무시
                         continue
                         
                     table = doc.add_table(rows=1, cols=1)
-                    table.style = 'Table Grid' # 테두리
+                    table.style = 'Table Grid'
                     
                     cell = table.cell(0, 0)
-                    cell.text = "" # 셀 초기화
+                    cell.text = ""
                     lines = box_text.split('\n')
-                    cell.paragraphs[0].text = lines[0] # 첫 줄
-                    for line in lines[1:]: # 나머지 줄
+                    cell.paragraphs[0].text = lines[0]
+                    for line in lines[1:]:
                         cell.add_paragraph(line)
                     
-                    doc.add_paragraph() # 간격 확보
+                    doc.add_paragraph()
                     
                 except Exception as e:
-                    print(f"  [!] 1x1 표 삽입 실패: {e}")
+                    print(f"  [!] '1x1 표' 삽입 실패: {e}")
 
 
         if pnum < pages - 1:
@@ -298,13 +349,13 @@ except ImportError:
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python pdf_hybrid_converter_v12_kor.py <input.pdf> <output.docx>")
+        print("Usage: python pdf_hybrid_converter_v14_kor.py <input.pdf> <output.docx>")
         sys.exit(1)
     
-    debug_path = "./debug_v12"
+    debug_path = "./debug_v14"
     if len(sys.argv) > 3:
         debug_path = sys.argv[3]
         
-    convert_pdf_to_word_v12_1(pdf_path=sys.argv[1], 
-                              word_path=sys.argv[2], 
-                              debug_dir=debug_path)
+    convert_pdf_to_word_v14(pdf_path=sys.argv[1], 
+                            word_path=sys.argv[2], 
+                            debug_dir=debug_path)
