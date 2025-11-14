@@ -1,20 +1,18 @@
-# pdf_hybrid_converter_v9_kor.py
-# 하이브리드 PDF->DOCX v9 (드로잉 + 임베디드 이미지 전략)
+# pdf_hybrid_converter_v12_kor.py
+# 하이브리드 PDF->DOCX v12.1 (이미지 + 데이터 표 + *모든* 벡터 박스)
 #
-# 전략:
-#  - 1. 벡터 드로잉 영역과 2. 임베디드 비트맵 이미지를 *모두* 찾습니다.
-#  - 1. get_drawing_regions(): fitz.get_drawings()를 사용해 벡터 클러스터를 찾아 렌더링합니다 (v8 방식).
-#  - 2. get_embedded_images(): fitz.get_images()를 사용해 기존 비트맵 이미지를 추출합니다.
-#  - 두 목록을 `all_graphic_elements`로 결합합니다.
-#  - 이 그래픽 영역 내부에 있는 텍스트 블록은 필터링합니다.
-#  - 모든 요소(텍스트 + 이미지)를 y축 순서대로 DOCX에 삽입합니다.
+# 전략: 3가지 엔진을 모두 사용
+#  - 1. find_image_elements: 비트맵 이미지(플로우차트 등) -> '이미지'로 삽입
+#  - 2. find_table_bboxes: 데이터 표('패스1/패스2' 등) -> '1x1 편집 가능 표'로 삽입
+#  - 3. find_drawing_bboxes: [v12.1] *모든* 벡터 박스('세그먼트' 등) -> '1x1 편집 가능 표'로 삽입
 #
-# 사용법: python pdf_hybrid_converter_v9_kor.py input.pdf output.docx
+# 사용법: python pdf_hybrid_converter_v12_kor.py input.pdf output.docx
 #
 import sys, os, io, math, traceback
 import fitz  # pymupdf
 import docx
 from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # MATLAB 연동을 위한 UTF-8 표준 출력 설정
 try:
@@ -29,22 +27,80 @@ def pixels_to_inches(px, dpi):
 
 def clamp(x, a, b): return max(a, min(b, x))
 
-def get_drawing_regions(page, dpi=300, min_area_pt=500, merge_margin=10):
-    """
-    (v8) fitz.get_drawings()를 사용해 벡터 드로잉 영역(차트, 표 등)을
-    클러스터링하여 감지합니다.
-    반환값: dict 리스트 [{"bbox": fitz.IRect, "data": image_bytes, "source": "drawing"}]
-    """
+# --- [엔진 1: v9] 임베디드 이미지 감지 함수 ---
+def find_image_elements(page, doc):
+    """ (v9) 임베디드 비트맵 이미지를 '이미지'로 추출 (예: 1페이지 플로우차트) """
+    img_list = page.get_images(full=True)
+    final_elements = []
+    for img_info in img_list:
+        xref = img_info[0]
+        if xref == 0: continue
+        try:
+            bbox_data = page.get_image_bbox(img_info)
+            bbox_rect = None
+            if isinstance(bbox_data, (tuple, list)) and len(bbox_data) == 4:
+                bbox_rect = fitz.Rect(bbox_data)
+            elif isinstance(bbox_data, fitz.Rect):
+                bbox_rect = bbox_data
+            else:
+                print(f"  [!] 알 수 없는 이미지 bbox 타입, 건너뜀: {type(bbox_data)}")
+                continue
+
+            if not bbox_rect.is_valid or bbox_rect.is_empty:
+                continue
+                
+            img_data = doc.extract_image(xref)
+            img_bytes = img_data["image"]
+            final_elements.append({
+                "type": "image", # -> 이미지로 처리
+                "bbox": bbox_rect.irect, 
+                "data": img_bytes, 
+                "source": "embedded_image"
+            })
+        except Exception as e:
+            print(f"  [!] 임베디드 이미지 추출 오류 (xref={xref}): {e}")
+    return final_elements
+
+# --- [엔진 2: v10.4] 데이터 '표' 좌표 감지 함수 ---
+def find_table_bboxes(page):
+    """ (v10.4) page.find_tables()를 사용해 '데이터 표' 영역의 '좌표(bbox)'만 가져옵니다. """
+    tables = page.find_tables()
+    final_bboxes = []
+    for tab in tables:
+        try:
+            bbox_data = tab.bbox 
+            bbox_rect = None
+            if isinstance(bbox_data, (tuple, list)) and len(bbox_data) == 4:
+                bbox_rect = fitz.Rect(bbox_data)
+            elif isinstance(bbox_data, fitz.Rect):
+                bbox_rect = bbox_data
+            else:
+                print(f"  [!] 알 수 없는 표 bbox 타입, 건너뜀: {type(bbox_data)}")
+                continue
+
+            if bbox_rect.is_empty or not bbox_rect.is_valid:
+                continue
+                
+            final_bboxes.append({
+                "type": "table_bbox", # -> 1x1 표로 처리
+                "bbox": bbox_rect.irect,
+                "source": "table_bbox"
+            })
+        except Exception as e:
+            print(f"  [!] 표 bbox 처리 오류: {e}")
+    return final_bboxes
+
+# --- [엔진 3: v12.1] *모든* 벡터 '박스' 좌표 감지 함수 ---
+def find_drawing_bboxes(page, min_area_pt=50, merge_margin=10):
+    """ (v12.1) fitz.get_drawings()를 사용해 '모든 드로잉' 영역의 '좌표(bbox)'만 가져옵니다. """
     drawings = page.get_drawings()
-    if not drawings:
-        return []
-
-    # 1. 모든 개별 경로(path)의 바운딩 박스를 가져옵니다.
+    if not drawings: return []
+    
+    # --- v12.1 수정: 'l', 're' 필터 제거. 모든 드로잉 타입을 감지 ---
     paths = [d["rect"] for d in drawings if d["rect"].get_area() > 0]
-    if not paths:
-        return []
+    if not paths: return []
 
-    # 2. 가깝거나 교차하는 사각형들을 클러스터링(병합)합니다.
+    # v8 로직: 가까운 드로잉을 클러스터링
     rects = list(paths)
     merged = True
     while merged:
@@ -53,86 +109,32 @@ def get_drawing_regions(page, dpi=300, min_area_pt=500, merge_margin=10):
         while i < len(rects):
             j = i + 1
             while j < len(rects):
-                # 약간의 여백(margin)을 두고 교차 검사
                 r1_inflated = rects[i].irect + (-merge_margin, -merge_margin, merge_margin, merge_margin)
                 if r1_inflated.intersects(rects[j]):
-                    # rects[i]와 rects[j]를 병합
                     rects[i] = rects[i] | rects[j]
-                    # rects[j] 제거
                     rects.pop(j)
-                    merged = True # 병합이 발생했음을 알림
+                    merged = True
                 else:
                     j += 1
             i += 1
     
-    # 3. 최종 클러스터(사각형)들을 각각 이미지로 렌더링합니다.
-    final_regions = []
-    mat = fitz.Matrix(dpi/72.0, dpi/72.0)
-    
+    final_bboxes = []
     for rect in rects:
         # 너무 작은 클러스터는 무시
-        if rect.get_area() < min_area_pt:
+        if rect.get_area() < min_area_pt: 
             continue
-            
-        # 캡처 영역에 약간의 패딩(여백) 추가
-        clip_rect = (rect.irect + (-5, -5, 5, 5)).normalize()
-        # 페이지 경계 안에 있도록 보장
-        clip_rect = fitz.Rect.intersect(clip_rect, page.rect)
         
-        if clip_rect.is_empty or clip_rect.is_infinite:
-            continue
-            
-        try:
-            # get_pixmap의 clip 인자에는 float 타입의 Rect가 필요
-            clip_rect_float = fitz.Rect(clip_rect)
-            pix = page.get_pixmap(matrix=mat, clip=clip_rect_float, alpha=False)
-            # 다이어그램의 손실 없는 렌더링을 위해 PNG 사용
-            img_bytes = pix.tobytes("png")
-            final_regions.append({
-                "bbox": clip_rect.irect, # IRect(정수형) 버전으로 bbox 저장
-                "data": img_bytes, 
-                "source": "drawing_render"
-            })
-        except Exception as e:
-            print(f"  ⚠ 드로잉 렌더링 오류 (clip={clip_rect}): {e}")
+        # v12: 렌더링(이미지 캡처) 대신, bbox만 반환
+        final_bboxes.append({
+            "type": "table_bbox", # -> 1x1 표로 처리
+            "bbox": rect.irect, 
+            "source": "drawing_bbox"
+        })
+    return final_bboxes
 
-    return final_regions
-
-def get_embedded_images(page, doc):
-    """
-    (v9) page.get_images()를 사용해 임베디드 비트맵 이미지를 추출합니다.
-    반환값: dict 리스트 [{"bbox": fitz.IRect, "data": image_bytes, "source": "embedded"}]
-    """
-    img_list = page.get_images(full=True)
-    final_regions = []
-
-    for img_info in img_list:
-        xref = img_info[0] # 이미지의 고유 ID
-        if xref == 0:
-            continue
-            
-        try:
-            # 페이지에서 이미지의 바운딩 박스(위치) 가져오기
-            bbox = page.get_image_bbox(img_info)
-            if not bbox.is_valid or bbox.is_empty:
-                continue
-
-            # 원본 이미지 바이트 추출
-            img_data = doc.extract_image(xref)
-            img_bytes = img_data["image"]
-            
-            final_regions.append({
-                "bbox": bbox.irect, # IRect(정수형) 버전으로 bbox 저장
-                "data": img_bytes, 
-                "source": "embedded_image"
-            })
-        except Exception as e:
-            print(f"  ⚠ 임베디드 이미지 추출 오류 (xref={xref}): {e}")
-            
-    return final_regions
-
-def convert_pdf_to_word_v9(pdf_path, word_path, dpi=300, max_width_in=6.5, debug_dir="./debug_v9"):
-    print(f"--- PDF→Word v9 (하이브리드) 시작 ---")
+# --- [v12.1] 메인 변환 함수 ---
+def convert_pdf_to_word_v12_1(pdf_path, word_path, dpi=200, max_width_in=6.5, debug_dir="./debug_v12"):
+    print(f"--- PDF->Word v12.1 (3중 감지) 시작 ---")
     print(f"입력: {pdf_path}")
     pdf = fitz.open(pdf_path)
     doc = docx.Document()
@@ -143,111 +145,146 @@ def convert_pdf_to_word_v9(pdf_path, word_path, dpi=300, max_width_in=6.5, debug
         page = pdf.load_page(pnum)
         print(f"\n페이지 {pnum+1}/{pages} 처리중...")
         
-        # 1. 모든 그래픽 영역 감지
-        # (v8) 벡터 드로잉 찾기
-        drawing_regions = get_drawing_regions(page, dpi=dpi, merge_margin=10)
-        print(f"  드로잉(벡터) 영역 감지: {len(drawing_regions)}")
+        # 1. 모든 비-텍스트 요소 감지
         
-        # (v9) 임베디드 비트맵 이미지 찾기
-        image_regions = get_embedded_images(page, pdf) # 메인 doc 객체 전달
-        print(f"  임베디드(비트맵) 이미지 감지: {len(image_regions)}")
+        # 엔진 1: 비트맵 이미지 (-> 이미지)
+        image_elements = find_image_elements(page, pdf)
+        print(f"  임베디드(비트맵) 이미지 감지: {len(image_elements)}")
+        
+        # 엔진 2: 데이터 표 (-> 1x1 표)
+        table_elements = find_table_bboxes(page)
+        print(f"  표/박스(Table) 영역 감지: {len(table_elements)}")
 
-        all_graphic_elements = drawing_regions + image_regions
-        all_graphic_rects = [r["bbox"] for r in all_graphic_elements] # IRect (정수형 사각형) 목록
+        # 엔진 3: 벡터 박스 (-> 1x1 표)
+        drawing_elements = find_drawing_bboxes(page, min_area_pt=50)
+        print(f"  드로잉(벡터 박스) 영역 감지: {len(drawing_elements)}")
 
-        # 2. 모든 텍스트 블록 가져오기
-        text_blocks = page.get_text("blocks")  # (x0,y0,x1,y1,text,...)
+        # 2. 모든 요소 목록 및 필터링 영역 정의
+        all_elements = []
+        all_filter_rects = [] # 텍스트를 필터링할 영역 (이미지 + 표 + 박스)
 
-        # 3. 요소 목록 생성 (텍스트 + 그래픽)
-        elements = []
+        # 이미지 요소를 추가
+        for el in image_elements:
+            all_elements.append(el)
+            all_filter_rects.append(el["bbox"])
 
-        # 텍스트 블록 추가 (그래픽 영역 내부에 있는 텍스트는 *필터링*)
+        # 편집 가능한 표/박스 요소를 추가
+        editable_boxes = table_elements + drawing_elements
+        
+        # v12.1: 표/박스 간의 중복(포함 관계) 제거
+        # (예: '패스1/패스2'는 '표'이면서 '드로잉'일 수 있음. 더 큰 영역만 남김)
+        final_editable_boxes = []
+        if editable_boxes:
+            # bbox 기준으로 정렬 (더 큰 박스가 먼저 오도록)
+            editable_boxes.sort(key=lambda b: -fitz.Rect(b["bbox"]).get_area())
+            
+            for box_a in editable_boxes:
+                is_contained = False
+                for box_b in final_editable_boxes: # 이미 추가된 (더 큰) 박스들과 비교
+                    if fitz.Rect(box_b["bbox"]).contains(box_a["bbox"]):
+                        is_contained = True # A가 이미 추가된 B에 포함되면 A는 탈락
+                        break
+                if not is_contained:
+                    final_editable_boxes.append(box_a)
+        
+        print(f"  중복제거 후 편집가능 박스: {len(final_editable_boxes)}")
+        
+        for el in final_editable_boxes:
+            all_elements.append(el)
+            all_filter_rects.append(el["bbox"])
+
+        # 3. 텍스트 블록 가져오기 (필터링)
+        text_blocks = page.get_text("blocks")
         for b in text_blocks:
             x0, y0, x1, y1 = b[:4]
             txt = b[4].strip()
-            if not txt:
-                continue
+            if not txt: continue
             
             block_rect = fitz.Rect(x0, y0, x1, y1)
-            is_inside_graphic = False
+            is_inside_other_element = False
             
-            # 이 텍스트 블록이 그래픽 영역 내부에 완전히 포함되는지 확인
-            for graphic_rect in all_graphic_rects: # graphic_rect는 IRect
-                if (graphic_rect + (-2,-2,2,2)).contains(block_rect): # 약간의 여유분
-                    is_inside_graphic = True
-                    # print(f"  텍스트 필터링: '{txt[:20]}...' (그림 영역에 포함됨)")
+            # (v12) 모든 필터 영역(이미지+표+박스) 내부 텍스트는 무시
+            for filter_rect in all_filter_rects:
+                if (filter_rect + (-2,-2,2,2)).contains(block_rect):
+                    is_inside_other_element = True
                     break
             
-            if not is_inside_graphic:
-                elements.append({"type":"text", "bbox": block_rect, "data": txt})
-
-        # 모든 그래픽 요소를 목록에 추가
-        os.makedirs(debug_dir, exist_ok=True)
-        for idx, r in enumerate(all_graphic_elements):
-            debug_path = os.path.join(debug_dir, f"page{pnum+1}_graphic{idx+1}_{r['source']}.png")
-            try:
-                # 디버그용 사본 저장
-                with open(debug_path, "wb") as f_crop:
-                    f_crop.write(r["data"])
-                
-                r.update({
-                    "type": "image",
-                    "debug_path": debug_path
-                })
-                elements.append(r)
-                
-            except Exception as e:
-                print(f"  ⚠ 디버그 이미지 저장 실패: {e}")
+            if not is_inside_other_element:
+                all_elements.append({"type":"text", "bbox": block_rect, "data": txt})
 
         # 4. 모든 요소를 y축(세로) 위치, 그 다음 x축(가로) 위치로 정렬
-        elements.sort(key=lambda el:(round(el["bbox"][1],1), el["bbox"][0]))
+        all_elements.sort(key=lambda el:(round(el["bbox"][1],1), el["bbox"][0]))
 
         # 5. 순서대로 DOCX에 삽입
-        for el in elements:
+        os.makedirs(debug_dir, exist_ok=True)
+        for el in all_elements:
             if el["type"] == "text":
-                # 줄바꿈 유지
                 for line in el["data"].splitlines():
                     doc.add_paragraph(line)
             
             elif el["type"] == "image":
                 x0, y0, x1, y1 = el["bbox"]
                 width_pt = x1 - x0
-                # 페이지 최대 너비 제한
                 width_in = clamp(width_pt / 72.0, 0.5, max_width_in)
                 try:
                     para = doc.add_paragraph()
                     run = para.add_run()
-                    
                     img_io = None
-                    # docx 삽입을 위해 바이트에서 이미지 유형 확인
                     if el["data"].startswith(b'\x89PNG'):
                         img_io = io.BytesIO(el["data"])
                     else:
-                        # 다른 포맷(PDF 네이티브 포맷 등)을 PNG로 변환 시도
                         try:
                             pil_img = Image.open(io.BytesIO(el["data"]))
                             img_io = io.BytesIO()
                             pil_img.save(img_io, format='PNG')
                             img_io.seek(0)
                         except Exception:
-                            # PIL 변환 실패 시 원본 바이트 사용 (docx에서 실패할 수 있음)
-                            print(f"  ⚠ PIL 변환 실패: {el['debug_path']}. 원본 바이트 시도.")
+                            print(f"  [!] PIL 변환 실패: 원본 바이트 시도.")
                             img_io = io.BytesIO(el["data"])
-
+                    
+                    debug_path = os.path.join(debug_dir, f"page{pnum+1}_img_{el['bbox'][0]}.png")
+                    with open(debug_path, "wb") as f: f.write(img_io.getvalue())
+                    
                     run.add_picture(img_io, width=Inches(width_in))
-                    para.space_after = Pt(4) # 단락 뒤 간격
+                    para.space_after = Pt(4)
                 except Exception as e:
-                    print(f"  ⚠ 이미지 삽입 실패 ({el.get('debug_path','?')}): {e}")
+                    print(f"  [!] 이미지 삽입 실패: {e}")
+
+            # [v12] '데이터 표'와 '벡터 박스' 모두 1x1 표로 삽입
+            elif el["type"] == "table_bbox":
+                try:
+                    table_bbox_float = fitz.Rect(el["bbox"])
+                    
+                    # 해당 박스(bbox) 영역의 텍스트만 다시 추출
+                    box_text = page.get_text(clip=table_bbox_float, sort=True, flags=0).strip()
+
+                    if not box_text: # 텍스트가 없는 빈 박스면(예: 하이라이트) 무시
+                        continue
+                        
+                    table = doc.add_table(rows=1, cols=1)
+                    table.style = 'Table Grid' # 테두리
+                    
+                    cell = table.cell(0, 0)
+                    cell.text = "" # 셀 초기화
+                    lines = box_text.split('\n')
+                    cell.paragraphs[0].text = lines[0] # 첫 줄
+                    for line in lines[1:]: # 나머지 줄
+                        cell.add_paragraph(line)
+                    
+                    doc.add_paragraph() # 간격 확보
+                    
+                except Exception as e:
+                    print(f"  [!] 1x1 표 삽입 실패: {e}")
+
 
         if pnum < pages - 1:
             doc.add_page_break()
 
     doc.save(word_path)
     print(f"\n완료: {word_path}")
-    print(f"디버그 이미지들은 '{os.path.abspath(debug_dir)}'에 저장됩니다 (확인하세요).")
+    print(f"디버그 파일들은 '{os.path.abspath(debug_dir)}'에 저장됩니다 (확인하세요).")
 
 # --- v9.1: 이미지 형식 변환을 위해 PIL 의존성 추가 ---
-# pymupdf가 추출할 수 있는 non-PNG/JPG 포맷 변환에 PIL 필요
 try:
     from PIL import Image
 except ImportError:
@@ -261,14 +298,13 @@ except ImportError:
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python pdf_hybrid_converter_v9_kor.py <input.pdf> <output.docx>")
+        print("Usage: python pdf_hybrid_converter_v12_kor.py <input.pdf> <output.docx>")
         sys.exit(1)
     
-    # 디버그 디렉토리 설정 (옵션)
-    debug_path = "./debug_v9"
+    debug_path = "./debug_v12"
     if len(sys.argv) > 3:
         debug_path = sys.argv[3]
         
-    convert_pdf_to_word_v9(pdf_path=sys.argv[1], 
-                           word_path=sys.argv[2], 
-                           debug_dir=debug_path)
+    convert_pdf_to_word_v12_1(pdf_path=sys.argv[1], 
+                              word_path=sys.argv[2], 
+                              debug_dir=debug_path)
