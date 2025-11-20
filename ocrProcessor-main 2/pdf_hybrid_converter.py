@@ -1,23 +1,17 @@
-# pdf_hybrid_converter_v14_kor.py
-# 하이브리드 PDF->DOCX v14 (이미지 + 하이브리드 표 + 벡터 박스)
+# pdf_hybrid_converter_v18_kor.py
+# 하이브리드 PDF->DOCX v18 (이미지 크기 원본 반영)
 #
-# 전략: 3가지 엔진 결합 + 중복 제거
-#  - 1. find_image_elements: 비트맵 이미지 -> '이미지'로 삽입
-#  - 2. find_tables_hybrid:
-#     - (A) 데이터 표 -> '다중 셀 표'로 삽입
-#     - (B) 1줄 박스 -> '1x1 표'로 삽입
-#  - 3. find_drawing_bboxes: 기타 벡터 박스 -> '1x1 표'로 삽입
-#  - 4. (2)와 (3)의 결과를 중복 제거하여 통합
+# [v18 개선사항]
+# 1. 이미지 삽입 시 크기(Width)를 강제 고정하지 않고, PDF 원본 크기(BBox)를 계산하여 적용
+# 2. "헤더/푸터 + 2단 본문" 구조 지원 유지
+# 3. (Box Area) 텍스트 복구 및 글머리 기호 정리 유지
 #
-# 사용법: python pdf_hybrid_converter_v14_kor.py input.pdf output.docx
-#
-import sys, os, io, math, traceback
-import fitz  # pymupdf
+import sys, os, io, fitz  # pymupdf
 import docx
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-# MATLAB 연동을 위한 UTF-8 표준 출력 설정
+# MATLAB 연동용 UTF-8 설정
 try:
     import sys as _sys, io as _io
     _sys.stdout = _io.TextIOWrapper(_sys.stdout.buffer, encoding='utf-8')
@@ -25,337 +19,238 @@ try:
 except Exception:
     pass
 
-def pixels_to_inches(px, dpi):
-    return px / dpi
-
 def clamp(x, a, b): return max(a, min(b, x))
 
-# --- [엔진 1: v9] 임베디드 이미지 감지 함수 ---
+# --- [Helper] 글머리 기호 정리 및 스타일 반환 ---
+def clean_text_and_style(text):
+    bullets = ['•', '-', 'o', '·', '➢', '', 'v', '', '\uf0b7'] 
+    clean_txt = text.strip()
+    for b in bullets:
+        if clean_txt.startswith(b):
+            return clean_txt[len(b):].strip(), 'List Bullet'
+    return clean_txt, None
+
+# --- [Helper] 고급 2단 레이아웃 감지 (헤더/푸터 분리) ---
+def detect_layout_and_split(page, text_blocks, page_width, page_height):
+    center_x = page_width / 2
+    margin = 15
+    
+    sorted_blocks = sorted(text_blocks, key=lambda b: b[1])
+    if not sorted_blocks: return False, [], [], [], []
+
+    crossing_indices = []
+    for i, b in enumerate(sorted_blocks):
+        x0, y0, x1, y1 = b[:4]
+        if x0 < center_x - margin and x1 > center_x + margin:
+            crossing_indices.append(i)
+            
+    if not crossing_indices:
+        start_idx = 0; end_idx = len(sorted_blocks)
+    else:
+        gaps = []
+        prev = -1
+        for curr in crossing_indices + [len(sorted_blocks)]:
+            if curr - prev - 1 > 0: gaps.append((prev + 1, curr))
+            prev = curr
+        if not gaps: return False, sorted_blocks, [], [], []
+        
+        gaps.sort(key=lambda x: x[1] - x[0], reverse=True)
+        start_idx, end_idx = gaps[0]
+        if (end_idx - start_idx) < 2: return False, sorted_blocks, [], [], []
+
+    top_blocks = sorted_blocks[:start_idx]
+    body_candidates = sorted_blocks[start_idx:end_idx]
+    bottom_blocks = sorted_blocks[end_idx:]
+    
+    left_blocks = []
+    right_blocks = []
+    for b in body_candidates:
+        x0, y0, x1, y1 = b[:4]
+        if x1 < center_x + margin: left_blocks.append(b)
+        elif x0 > center_x - margin: right_blocks.append(b)
+        else: left_blocks.append(b)
+
+    if len(left_blocks) == 0 or len(right_blocks) == 0:
+        return False, sorted_blocks, [], [], []
+        
+    return True, top_blocks, left_blocks, right_blocks, bottom_blocks
+
+
+# --- [엔진 1] 이미지 ---
 def find_image_elements(page, doc):
-    """ (v9) 임베디드 비트맵 이미지를 '이미지'로 추출 (예: 1페이지 플로우차트) """
     img_list = page.get_images(full=True)
-    final_elements = []
-    for img_info in img_list:
-        xref = img_info[0]
-        if xref == 0: continue
+    final = []
+    for img in img_list:
         try:
-            bbox_data = page.get_image_bbox(img_info)
-            bbox_rect = None
-            if isinstance(bbox_data, (tuple, list)) and len(bbox_data) == 4:
-                bbox_rect = fitz.Rect(bbox_data)
-            elif isinstance(bbox_data, fitz.Rect):
-                bbox_rect = bbox_data
-            else:
-                print(f"  [!] 알 수 없는 이미지 bbox 타입, 건너뜀: {type(bbox_data)}")
-                continue
+            xref = img[0]
+            if xref == 0: continue
+            bbox = page.get_image_bbox(img)
+            if not bbox: continue
+            r = fitz.Rect(bbox)
+            if not r.is_valid or r.is_empty: continue
+            final.append({"type": "image", "bbox": r.irect, "data": doc.extract_image(xref)["image"]})
+        except: pass
+    return final
 
-            if not bbox_rect.is_valid or bbox_rect.is_empty:
-                continue
-                
-            img_data = doc.extract_image(xref)
-            img_bytes = img_data["image"]
-            final_elements.append({
-                "type": "image", # -> 이미지로 처리
-                "bbox": bbox_rect.irect, 
-                "data": img_bytes, 
-                "source": "embedded_image"
-            })
-        except Exception as e:
-            print(f"  [!] 임베디드 이미지 추출 오류 (xref={xref}): {e}")
-    return final_elements
-
-# --- [엔진 2: v13] '하이브리드 표' 감지 함수 ---
+# --- [엔진 2] 표 ---
 def find_tables_hybrid(page):
-    """ (v13) '데이터 표'와 '장식용 박스'를 구분하여 감지 """
     tables = page.find_tables()
-    final_elements = []
-    
+    final = []
     for tab in tables:
-        try:
-            bbox_data = tab.bbox 
-            bbox_rect = None
-            if isinstance(bbox_data, (tuple, list)) and len(bbox_data) == 4:
-                bbox_rect = fitz.Rect(bbox_data)
-            elif isinstance(bbox_data, fitz.Rect):
-                bbox_rect = bbox_data
-            else:
-                print(f"  [!] 알 수 없는 표 bbox 타입, 건너뜀: {type(bbox_data)}")
-                continue
+        if tab.bbox and fitz.Rect(tab.bbox).is_valid and tab.row_count > 1:
+            ext = tab.extract()
+            if ext: final.append({"type": "data_table", "bbox": fitz.Rect(tab.bbox).irect, "data": ext})
+    return final
 
-            if bbox_rect.is_empty or not bbox_rect.is_valid:
-                continue
-            
-            # --- [v13] 하이브리드 로직 분기 ---
-            if tab.row_count > 1:
-                # A. '데이터 표' (예: '패스1/패스2') -> 원본 구조 복원 시도
-                cells_data = []
-                extracted_rows = tab.extract()
-                if not extracted_rows: continue
-                
-                clean_rows = []
-                max_cols = 0
-                for r_idx, row in enumerate(extracted_rows):
-                    if row:
-                        clean_row = [str(cell).strip() if cell else "" for cell in row]
-                        max_cols = max(max_cols, len(clean_row))
-                        clean_rows.append(clean_row)
-                
-                if not clean_rows or max_cols == 0: continue
-                
-                final_cells_data = []
-                for r_idx, row in enumerate(clean_rows):
-                    row_data = row + [""] * (max_cols - len(row)) # 빈 셀 채우기
-                    for c_idx, text in enumerate(row_data):
-                        final_cells_data.append( (r_idx, c_idx, text) )
-
-                final_elements.append({
-                    "type": "data_table", # -> '다중 셀 표'로 처리
-                    "bbox": bbox_rect.irect,
-                    "data": (len(clean_rows), max_cols, final_cells_data),
-                    "source": "table_data"
-                })
-            
-            elif tab.row_count == 1:
-                # B. '장식용 박스' (예: '세그먼트 기법') -> 1x1 표로 처리
-                final_elements.append({
-                    "type": "box_table", # -> '1x1 표'로 처리
-                    "bbox": bbox_rect.irect,
-                    "source": "table_box"
-                })
-            
-        except Exception as e:
-            print(f"  [!] 표 감지 처리 오류: {e}")
-            
-    return final_elements
-
-# --- [엔진 3: v12.1] *모든* 벡터 '박스' 좌표 감지 함수 ---
-def find_drawing_bboxes(page, min_area_pt=50, merge_margin=10):
-    """ (v12.1) fitz.get_drawings()를 사용해 '모든 드로잉' 영역의 '좌표(bbox)'만 가져옵니다. """
+# --- [엔진 3] 박스 ---
+def find_drawing_bboxes(page):
     drawings = page.get_drawings()
-    if not drawings: return []
+    rects = [d["rect"] for d in drawings if d["rect"].get_area() > 100]
+    unique = []
+    for r in rects:
+        dup = False
+        for u in unique:
+            if u.intersects(r) and (u.intersect(r).get_area() / r.get_area() > 0.8):
+                dup = True; break
+        if not dup: unique.append(r)
+    return [{"type": "box_table", "bbox": r.irect} for r in unique]
+
+# --- [Helper] 이미지 삽입 함수 (크기 자동 계산) ---
+def insert_image_auto_size(paragraph, img_obj):
+    """ PDF의 bbox 너비를 인치로 변환하여 워드에 삽입 """
+    try:
+        x0, y0, x1, y1 = img_obj["bbox"]
+        width_pt = x1 - x0
+        width_in = width_pt / 72.0  # PDF point to inch conversion
+        
+        # 너무 크면(6인치 초과) 줄이고, 너무 작으면(0.2인치 미만) 최소값 유지
+        width_in = max(0.2, min(width_in, 6.5))
+        
+        run = paragraph.add_run()
+        run.add_picture(io.BytesIO(img_obj["data"]), width=Inches(width_in))
+    except Exception as e:
+        print(f"  [!] 이미지 삽입 오류: {e}")
+
+# --- 메인 변환 ---
+def convert_pdf_to_word_v18(pdf_path, word_path):
+    print(f"--- PDF->Word v18 (이미지 크기 자동 최적화) ---")
+    doc = fitz.open(pdf_path)
+    docx_doc = docx.Document()
     
-    paths = [d["rect"] for d in drawings if d["rect"].get_area() > 0]
-    if not paths: return []
-
-    rects = list(paths)
-    merged = True
-    while merged:
-        merged = False
-        i = 0
-        while i < len(rects):
-            j = i + 1
-            while j < len(rects):
-                r1_inflated = rects[i].irect + (-merge_margin, -merge_margin, merge_margin, merge_margin)
-                if r1_inflated.intersects(rects[j]):
-                    rects[i] = rects[i] | rects[j]
-                    rects.pop(j)
-                    merged = True
-                else:
-                    j += 1
-            i += 1
-    
-    final_bboxes = []
-    for rect in rects:
-        if rect.get_area() < min_area_pt: 
-            continue
+    for pnum, page in enumerate(doc):
+        print(f"Page {pnum+1} 처리...")
+        w, h = page.rect.width, page.rect.height
         
-        final_bboxes.append({
-            "type": "box_table", # -> '1x1 표'로 처리
-            "bbox": rect.irect, 
-            "source": "drawing_box"
-        })
-    return final_bboxes
-
-
-# --- [v14] 메인 변환 함수 ---
-def convert_pdf_to_word_v14(pdf_path, word_path, dpi=200, max_width_in=6.5, debug_dir="./debug_v14"):
-    print(f"--- PDF->Word v14 (최종 전략) 시작 ---")
-    print(f"입력: {pdf_path}")
-    pdf = fitz.open(pdf_path)
-    doc = docx.Document()
-    pages = pdf.page_count
-    print(f"총 페이지: {pages}")
-
-    for pnum in range(pages):
-        page = pdf.load_page(pnum)
-        print(f"\n페이지 {pnum+1}/{pages} 처리중...")
+        images = find_image_elements(page, doc)
+        tables = find_tables_hybrid(page)
+        boxes = find_drawing_bboxes(page)
         
-        # 1. 모든 비-텍스트 요소 감지
+        filter_rects = [fitz.Rect(el["bbox"]) for el in images + tables + boxes]
         
-        # 엔진 1: 비트맵 이미지 (-> 이미지)
-        image_elements = find_image_elements(page, pdf)
-        print(f"  임베디드(비트맵) 이미지 감지: {len(image_elements)}")
+        text_blocks = []
+        for b in page.get_text("blocks"):
+            r = fitz.Rect(b[:4])
+            is_in = False
+            for fr in filter_rects:
+                if fr.contains(r): is_in = True; break
+            if not is_in and b[4].strip():
+                text_blocks.append(b)
+
+        is_2col, top_b, left_b, right_b, bot_b = detect_layout_and_split(page, text_blocks, w, h)
         
-        # 엔진 2: 데이터 표 + 장식용 박스 (-> 표)
-        table_elements = find_tables_hybrid(page)
-        print(f"  표/박스(Table) 영역 감지: {len(table_elements)}")
-
-        # 엔진 3: 기타 벡터 박스 (-> 1x1 표)
-        drawing_elements = find_drawing_bboxes(page, min_area_pt=50)
-        print(f"  드로잉(벡터 박스) 영역 감지: {len(drawing_elements)}")
-
-        # 2. 모든 요소 목록 및 필터링 영역 정의
-        all_elements = []
-        all_filter_rects = [] # 텍스트를 필터링할 영역 (이미지 + 표 + 박스)
-
-        # 이미지 요소를 추가
-        for el in image_elements:
-            all_elements.append(el)
-            all_filter_rects.append(el["bbox"])
-
-        # 편집 가능한 표/박스 요소를 추가 (엔진 2 + 엔진 3)
-        editable_boxes = table_elements + drawing_elements
+        def render_blocks(block_list):
+            block_list.sort(key=lambda b: b[1])
+            for b in block_list:
+                txt, style = clean_text_and_style(b[4])
+                if txt:
+                    p = docx_doc.add_paragraph(txt)
+                    if style: p.style = style
         
-        # [v14] 중복 제거 로직
-        final_editable_boxes = []
-        if editable_boxes:
-            # bbox 기준으로 정렬 (더 큰 박스가 먼저 오도록)
-            editable_boxes.sort(key=lambda b: -fitz.Rect(b["bbox"]).get_area())
+        if is_2col:
+            print("  -> 2단 레이아웃 적용")
             
-            for box_a in editable_boxes:
-                is_contained = False
-                for box_b in final_editable_boxes: # 이미 추가된 (더 큰) 박스들과 비교
-                    if fitz.Rect(box_b["bbox"]).contains(box_a["bbox"]):
-                        is_contained = True # A가 이미 추가된 B에 포함되면 A는 탈락
-                        break
-                if not is_contained:
-                    final_editable_boxes.append(box_a)
-        
-        print(f"  중복제거 후 편집가능 박스: {len(final_editable_boxes)}")
-        
-        for el in final_editable_boxes:
-            all_elements.append(el)
-            all_filter_rects.append(el["bbox"])
-
-        # 3. 텍스트 블록 가져오기 (필터링)
-        text_blocks = page.get_text("blocks")
-        for b in text_blocks:
-            x0, y0, x1, y1 = b[:4]
-            txt = b[4].strip()
-            if not txt: continue
+            # Top (Header) + 이미지 처리
+            # 상단 영역(헤더)에 있는 이미지만 골라내기
+            header_limit_y = top_b[-1][3] if top_b else 100
+            top_imgs = [img for img in images if img["bbox"][1] < header_limit_y]
             
-            block_rect = fitz.Rect(x0, y0, x1, y1)
-            is_inside_other_element = False
+            for img in top_imgs:
+                p = docx_doc.add_paragraph()
+                insert_image_auto_size(p, img) # [수정됨] 크기 자동 계산
             
-            for filter_rect in all_filter_rects:
-                if (filter_rect + (-2,-2,2,2)).contains(block_rect):
-                    is_inside_other_element = True
-                    break
+            render_blocks(top_b)
             
-            if not is_inside_other_element:
-                all_elements.append({"type":"text", "bbox": block_rect, "data": txt})
-
-        # 4. 모든 요소를 y축(세로) 위치, 그 다음 x축(가로) 위치로 정렬
-        all_elements.sort(key=lambda el:(round(el["bbox"][1],1), el["bbox"][0]))
-
-        # 5. 순서대로 DOCX에 삽입
-        os.makedirs(debug_dir, exist_ok=True)
-        for el in all_elements:
-            if el["type"] == "text":
-                for line in el["data"].splitlines():
-                    doc.add_paragraph(line)
+            # Body (2 Columns)
+            table = docx_doc.add_table(rows=1, cols=2)
+            table.autofit = False
             
-            elif el["type"] == "image":
-                x0, y0, x1, y1 = el["bbox"]
-                width_pt = x1 - x0
-                width_in = clamp(width_pt / 72.0, 0.5, max_width_in)
-                try:
-                    para = doc.add_paragraph()
-                    run = para.add_run()
-                    img_io = None
-                    if el["data"].startswith(b'\x89PNG'):
-                        img_io = io.BytesIO(el["data"])
-                    else:
-                        try:
-                            pil_img = Image.open(io.BytesIO(el["data"]))
-                            img_io = io.BytesIO()
-                            pil_img.save(img_io, format='PNG')
-                            img_io.seek(0)
-                        except Exception:
-                            print(f"  [!] PIL 변환 실패: 원본 바이트 시도.")
-                            img_io = io.BytesIO(el["data"])
-                    
-                    debug_path = os.path.join(debug_dir, f"page{pnum+1}_img_{el['bbox'][0]}.png")
-                    with open(debug_path, "wb") as f: f.write(img_io.getvalue())
-                    
-                    run.add_picture(img_io, width=Inches(width_in))
-                    para.space_after = Pt(4)
-                except Exception as e:
-                    print(f"  [!] 이미지 삽입 실패: {e}")
+            cell_l = table.cell(0, 0)
+            left_b.sort(key=lambda b: b[1])
+            for b in left_b:
+                txt, style = clean_text_and_style(b[4])
+                if txt:
+                    p = cell_l.add_paragraph(txt)
+                    if style: p.style = style
+            
+            cell_r = table.cell(0, 1)
+            right_b.sort(key=lambda b: b[1])
+            for b in right_b:
+                txt, style = clean_text_and_style(b[4])
+                if txt:
+                    p = cell_r.add_paragraph(txt)
+                    if style: p.style = style
+            
+            docx_doc.add_paragraph()
+            render_blocks(bot_b)
 
-            # [v13] A. '데이터 표' (다중 셀) 삽입
-            elif el["type"] == "data_table":
-                try:
-                    (rows, cols, cells_data) = el["data"]
-                    if rows == 0 or cols == 0: continue
-                        
-                    table = doc.add_table(rows=rows, cols=cols)
-                    table.style = 'Table Grid'
-                    
-                    for (r, c, text) in cells_data:
-                        if r < rows and c < cols:
-                            table.cell(r, c).text = text
-                            
-                    doc.add_paragraph()
-                    
-                except Exception as e:
-                    print(f"  [!] '데이터 표' 삽입 실패: {e}")
-
-            # [v13/v14] B. '장식용 박스' (1x1 셀) 삽입
-            elif el["type"] == "box_table":
-                try:
-                    table_bbox_float = fitz.Rect(el["bbox"])
-                    
-                    box_text = page.get_text(clip=table_bbox_float, sort=True, flags=0).strip()
-
-                    if not box_text:
-                        # [v14] 텍스트가 없는 순수 드로잉 박스(예: 하이라이트)는 무시
-                        continue
-                        
-                    table = doc.add_table(rows=1, cols=1)
-                    table.style = 'Table Grid'
-                    
-                    cell = table.cell(0, 0)
+        else:
+            # 1단 레이아웃
+            all_items = []
+            for img in images: all_items.append({'type':'img', 'obj':img, 'y':img['bbox'][1]})
+            for tab in tables: all_items.append({'type':'tab', 'obj':tab, 'y':tab['bbox'][1]})
+            for box in boxes:  all_items.append({'type':'box', 'obj':box, 'y':box['bbox'][1]})
+            for txt in text_blocks: all_items.append({'type':'txt', 'obj':txt, 'y':txt[1]})
+            all_items.sort(key=lambda x: x['y'])
+            
+            for item in all_items:
+                if item['type'] == 'txt':
+                    txt, style = clean_text_and_style(item['obj'][4])
+                    if txt:
+                        p = docx_doc.add_paragraph(txt)
+                        if style: p.style = style
+                elif item['type'] == 'img':
+                    p = docx_doc.add_paragraph()
+                    insert_image_auto_size(p, item['obj']) # [수정됨] 크기 자동 계산
+                elif item['type'] == 'tab':
+                    data = item['obj']['data']
+                    if not data: continue
+                    t = docx_doc.add_table(rows=len(data), cols=len(data[0]))
+                    t.style = 'Table Grid'
+                    for r, row in enumerate(data):
+                        for c, val in enumerate(row):
+                             if val: t.cell(r, c).text = str(val)
+                    docx_doc.add_paragraph()
+                elif item['type'] == 'box':
+                    box_rect = fitz.Rect(item['obj']['bbox'])
+                    box_text = page.get_text(clip=box_rect).strip()
+                    if not box_text: continue
+                    t = docx_doc.add_table(rows=1, cols=1)
+                    t.style = 'Table Grid'
+                    txt, style = clean_text_and_style(box_text)
+                    cell = t.cell(0,0)
                     cell.text = ""
-                    lines = box_text.split('\n')
-                    cell.paragraphs[0].text = lines[0]
-                    for line in lines[1:]:
-                        cell.add_paragraph(line)
-                    
-                    doc.add_paragraph()
-                    
-                except Exception as e:
-                    print(f"  [!] '1x1 표' 삽입 실패: {e}")
+                    p = cell.paragraphs[0]; p.text = txt
+                    if style: p.style = style
+                    docx_doc.add_paragraph()
 
+        if pnum < len(doc) - 1:
+            docx_doc.add_page_break()
 
-        if pnum < pages - 1:
-            doc.add_page_break()
-
-    doc.save(word_path)
-    print(f"\n완료: {word_path}")
-    print(f"디버그 파일들은 '{os.path.abspath(debug_dir)}'에 저장됩니다 (확인하세요).")
-
-# --- v9.1: 이미지 형식 변환을 위해 PIL 의존성 추가 ---
-try:
-    from PIL import Image
-except ImportError:
-    print("---------------------------------------------------------")
-    print("  오류: 'Pillow' 라이브러리가 필요합니다.")
-    print("  MATLAB 터미널에서 다음을 실행하세요:")
-    print("  !pip install Pillow")
-    print("---------------------------------------------------------")
-    sys.exit(1)
-
+    docx_doc.save(word_path)
+    print(f"완료: {word_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python pdf_hybrid_converter_v14_kor.py <input.pdf> <output.docx>")
+        print("Usage: python pdf_hybrid_converter_v18_kor.py <input.pdf> <output.docx>")
         sys.exit(1)
-    
-    debug_path = "./debug_v14"
-    if len(sys.argv) > 3:
-        debug_path = sys.argv[3]
-        
-    convert_pdf_to_word_v14(pdf_path=sys.argv[1], 
-                            word_path=sys.argv[2], 
-                            debug_dir=debug_path)
+    convert_pdf_to_word_v18(sys.argv[1], sys.argv[2])
